@@ -155,4 +155,4 @@ Worst-case loss at the 5th percentile of the final price distribution.
 
 ## License
 
-MIT — do whatever you want with it.
+MIT

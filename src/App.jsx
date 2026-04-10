@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
 // ─── ENV VARS ─────────────────────────────────────────────────────────────────
-const TD_KEY   = import.meta.env.VITE_TWELVEDATA_KEY ?? "";
-const GROQ_KEY = import.meta.env.VITE_GROQ_KEY       ?? "";
+const TD_KEY     = import.meta.env.VITE_TWELVEDATA_KEY ?? "";
+const GROQ_KEY   = import.meta.env.VITE_GROQ_KEY       ?? "";
 const GROQ_MODEL = "llama-3.3-70b-versatile";
 
 const DEFAULT_WATCHLIST = ["AAPL", "TSLA", "NVDA", "MSFT", "META", "AMZN"];
@@ -224,6 +224,20 @@ const GlobalStyle = () => (
     /* ── Divider ── */
     .divider { height: 1px; background: var(--border); margin: 20px 0; }
 
+    /* ── Progress bar ── */
+    .progress-wrap { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+    .progress-bar  { height: 100%; border-radius: 2px; transition: width 0.6s ease; }
+
+    /* ── Tooltip ── */
+    .tooltip-wrap { position: relative; display: inline-flex; }
+    .tooltip-wrap:hover .tooltip { opacity: 1; pointer-events: auto; }
+    .tooltip {
+      opacity: 0; pointer-events: none; transition: opacity 0.15s;
+      position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
+      background: var(--surface2); border: 1px solid var(--border2); border-radius: 4px;
+      padding: 5px 9px; font-size: 8px; color: var(--text2); white-space: nowrap; z-index: 200;
+    }
+
     /* ── Responsive ── */
     @media (max-width: 900px) {
       .nav { padding: 12px 18px; }
@@ -234,40 +248,49 @@ const GlobalStyle = () => (
 );
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
-const fmt = (n, d = 2) => (n == null || !isFinite(n) ? "—" : n.toFixed(d));
-const fmtPct = (n) => (n >= 0 ? "+" : "") + fmt(n) + "%";
+const fmt     = (n, d = 2) => (n == null || !isFinite(n) ? "—" : n.toFixed(d));
+const fmtPct  = (n) => (n >= 0 ? "+" : "") + fmt(n) + "%";
+const colorChg = (n) => n > 0 ? "var(--green)" : n < 0 ? "var(--accent)" : "var(--text2)";
+const classChg = (n) => n > 0 ? "up" : n < 0 ? "down" : "flat";
+
+// Box-Muller normal sample
 const randNorm = () => {
   let u = 0, v = 0;
   while (!u) u = Math.random();
   while (!v) v = Math.random();
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 };
-const colorChg = (n) => n > 0 ? "var(--green)" : n < 0 ? "var(--accent)" : "var(--text2)";
-const classChg = (n) => n > 0 ? "up" : n < 0 ? "down" : "flat";
 
 // ─── MATH ENGINE ─────────────────────────────────────────────────────────────
+
+/** Geometric Brownian Motion Monte Carlo */
 function runMonteCarlo({ S0, mu, sigma, days, n = 600, sentimentAdj = 0 }) {
-  const dt = 1 / 252;
-  const adjMu = mu + sentimentAdj;
-  const paths = [];
+  if (!S0 || !isFinite(S0) || !isFinite(mu) || !isFinite(sigma) || sigma <= 0) return [];
+  const dt     = 1 / 252;
+  const adjMu  = mu + sentimentAdj;
+  const paths  = [];
   for (let i = 0; i < n; i++) {
     const path = [S0];
     for (let d = 1; d <= days; d++) {
       const prev = path[path.length - 1];
-      path.push(prev * Math.exp((adjMu - 0.5 * sigma * sigma) * dt + sigma * Math.sqrt(dt) * randNorm()));
+      const next = prev * Math.exp((adjMu - 0.5 * sigma * sigma) * dt + sigma * Math.sqrt(dt) * randNorm());
+      path.push(isFinite(next) && next > 0 ? next : prev);
     }
     paths.push(path);
   }
   return paths;
 }
 
+/** 3-state Markov chain: Bear(0) / Neutral(1) / Bull(2) */
 function buildMarkovMatrix(returns) {
+  if (!returns || returns.length < 3) return null;
   const states = returns.map(r => r < -0.005 ? 0 : r > 0.005 ? 2 : 1);
   const m = [[1,1,1],[1,1,1],[1,1,1]];
   for (let i = 0; i < states.length - 1; i++) m[states[i]][states[i+1]]++;
-  return m.map(row => { const s = row.reduce((a,b) => a+b, 0); return row.map(v => v/s); });
+  return m.map(row => { const s = row.reduce((a,b)=>a+b,0); return row.map(v=>v/s); });
 }
 
+/** GBM parameter estimation from price history */
 function estimateGBM(prices) {
   if (!prices || prices.length < 2) return { mu: 0.08, sigma: 0.25, returns: [] };
   const returns = [];
@@ -275,18 +298,62 @@ function estimateGBM(prices) {
     const r = Math.log(prices[i] / prices[i-1]);
     if (isFinite(r)) returns.push(r);
   }
-  const mean = returns.reduce((a,b) => a+b, 0) / returns.length;
-  const variance = returns.reduce((a,b) => a + (b-mean)**2, 0) / returns.length;
-  return { mu: mean * 252, sigma: Math.sqrt(variance * 252), returns };
+  if (returns.length === 0) return { mu: 0.08, sigma: 0.25, returns: [] };
+  const mean     = returns.reduce((a,b)=>a+b,0) / returns.length;
+  const variance = returns.reduce((a,b)=>a+(b-mean)**2,0) / returns.length;
+  const sigma    = Math.sqrt(variance * 252);
+  return { mu: mean * 252, sigma: sigma > 0 ? sigma : 0.25, returns };
 }
 
+/** Value at Risk at given confidence */
 function calcVaR(finals, S0, conf = 0.95) {
-  const pnl = finals.map(p => (p - S0) / S0 * 100).sort((a,b) => a-b);
-  return pnl[Math.floor((1 - conf) * pnl.length)];
+  if (!finals || finals.length === 0 || !S0) return 0;
+  const pnl = finals.map(p => (p - S0) / S0 * 100).sort((a,b)=>a-b);
+  return pnl[Math.floor((1 - conf) * pnl.length)] ?? 0;
 }
 
+/** Sharpe Ratio */
 function calcSharpe(mu, sigma, rf = 0.05) {
   return sigma > 0 ? (mu - rf) / sigma : 0;
+}
+
+/** Percentile helper */
+const pctile = (arr, p) => {
+  if (!arr || arr.length === 0) return 0;
+  const s = [...arr].sort((a,b)=>a-b);
+  return s[Math.min(Math.floor(p * s.length / 100), s.length - 1)];
+};
+
+/** Compute full stats from finals */
+function computeStats(finals, S0, gbm, adj) {
+  if (!finals || finals.length === 0) return null;
+  const sorted = [...finals].sort((a,b)=>a-b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const mean   = finals.reduce((a,b)=>a+b,0) / finals.length;
+  const sigma  = gbm.sigma * (adj?.sigmaMultiplier || 1);
+  return {
+    probUp:      (finals.filter(f=>f>S0).length / finals.length) * 100,
+    prob5up:     (finals.filter(f=>f>S0*1.05).length / finals.length) * 100,
+    prob10up:    (finals.filter(f=>f>S0*1.10).length / finals.length) * 100,
+    prob15up:    (finals.filter(f=>f>S0*1.15).length / finals.length) * 100,
+    prob5down:   (finals.filter(f=>f<S0*0.95).length / finals.length) * 100,
+    prob10down:  (finals.filter(f=>f<S0*0.90).length / finals.length) * 100,
+    prob15down:  (finals.filter(f=>f<S0*0.85).length / finals.length) * 100,
+    median,
+    mean,
+    p5:   pctile(finals, 5),
+    p10:  pctile(finals, 10),
+    p25:  pctile(finals, 25),
+    p75:  pctile(finals, 75),
+    p90:  pctile(finals, 90),
+    p95:  pctile(finals, 95),
+    var95:   calcVaR(finals, S0, 0.95),
+    var99:   calcVaR(finals, S0, 0.99),
+    sharpe:  calcSharpe(gbm.mu, sigma),
+    expectedReturn: ((mean - S0) / S0) * 100,
+    medianReturn:   ((median - S0) / S0) * 100,
+    S0, adj, gbm, finals,
+  };
 }
 
 // ─── SPARKLINE ───────────────────────────────────────────────────────────────
@@ -302,43 +369,71 @@ function Sparkline({ prices, change, width = 56, height = 22 }) {
   }).join(" ");
   const color = change >= 0 ? "var(--green)" : "var(--accent)";
   return (
-    <svg width={width} height={height} className="ticker-spark" style={{ overflow: "visible" }}>
-      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.2" strokeLinejoin="round" strokeLinecap="round" />
+    <svg width={width} height={height} className="ticker-spark" style={{ overflow:"visible" }}>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.2" strokeLinejoin="round" strokeLinecap="round"/>
     </svg>
   );
 }
 
 // ─── CHART RENDERERS ─────────────────────────────────────────────────────────
+
+/**
+ * FIX: use ResizeObserver to wait for real layout width before drawing
+ */
+function useCanvasSize(ref, onReady) {
+  useEffect(() => {
+    if (!ref.current) return;
+    const el = ref.current.parentElement;
+    if (!el) return;
+    // If already has width, fire immediately
+    if (el.getBoundingClientRect().width > 0) {
+      onReady();
+      return;
+    }
+    // Otherwise observe until it does
+    const ro = new ResizeObserver(() => {
+      if (el.getBoundingClientRect().width > 0) {
+        ro.disconnect();
+        onReady();
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
+}
+
 function drawMCChart(canvas, paths, days, S0) {
-  if (!canvas) return;
-  const dpr = window.devicePixelRatio || 1;
+  if (!canvas || !paths || paths.length === 0) return;
+  const dpr  = window.devicePixelRatio || 1;
   const rect = canvas.parentElement.getBoundingClientRect();
-  canvas.width = rect.width * dpr;
-  canvas.height = 320 * dpr;
-  canvas.style.height = "320px";
+  const W    = Math.max(rect.width, 300);
+  canvas.width  = W * dpr;
+  canvas.height = 340 * dpr;
+  canvas.style.height = "340px";
   const ctx = canvas.getContext("2d");
   ctx.scale(dpr, dpr);
-  const W = rect.width, H = 320;
-  const pad = { top: 18, right: 28, bottom: 36, left: 58 };
-  const cW = W - pad.left - pad.right;
-  const cH = H - pad.top - pad.bottom;
+  const H   = 340;
+  const pad = { top: 20, right: 30, bottom: 40, left: 62 };
+  const cW  = W - pad.left - pad.right;
+  const cH  = H - pad.top  - pad.bottom;
 
   ctx.clearRect(0, 0, W, H);
   ctx.fillStyle = "#0e1014";
   ctx.fillRect(0, 0, W, H);
 
-  const allVals = paths.flat();
+  const allVals = paths.flat().filter(isFinite);
+  if (allVals.length === 0) return;
   const minV = Math.min(...allVals) * 0.994;
   const maxV = Math.max(...allVals) * 1.006;
   const xS = i => pad.left + (i / days) * cW;
-  const yS = v => pad.top + cH - ((v - minV) / (maxV - minV)) * cH;
+  const yS = v => pad.top + cH - ((v - minV) / (maxV - minV + 1e-9)) * cH;
 
-  // Grid
+  // Grid lines
   ctx.strokeStyle = "#1a1e27"; ctx.lineWidth = 1;
   for (let i = 0; i <= 5; i++) {
-    const y = pad.top + (i / 5) * cH;
-    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cW, y); ctx.stroke();
+    const y   = pad.top + (i / 5) * cH;
     const val = maxV - (i / 5) * (maxV - minV);
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cW, y); ctx.stroke();
     ctx.fillStyle = "#3a4252"; ctx.font = "8px 'IBM Plex Mono'";
     ctx.textAlign = "right"; ctx.fillText("$" + val.toFixed(0), pad.left - 6, y + 3);
   }
@@ -346,121 +441,209 @@ function drawMCChart(canvas, paths, days, S0) {
     const x = pad.left + (i / 6) * cW;
     ctx.beginPath(); ctx.moveTo(x, pad.top); ctx.lineTo(x, pad.top + cH); ctx.stroke();
     ctx.fillStyle = "#3a4252"; ctx.textAlign = "center";
-    ctx.fillText("D+" + Math.round((i/6)*days), x, pad.top + cH + 14);
+    ctx.fillText("D+" + Math.round((i / 6) * days), x, pad.top + cH + 14);
   }
 
-  // Percentile bands
-  const pct = (arr, p) => [...arr].sort((a,b)=>a-b)[Math.floor(p*arr.length/100)];
-  [[5,95,"rgba(78,158,255,0.05)"],[25,75,"rgba(78,158,255,0.1)"]].forEach(([lo,hi,fill]) => {
+  // Percentile shading bands
+  [[5,95,"rgba(78,158,255,0.04)"],[25,75,"rgba(78,158,255,0.09)"]].forEach(([lo,hi,fill]) => {
     ctx.beginPath();
     for (let d = 0; d <= days; d++) {
-      const vals = paths.map(p => p[d]);
-      d === 0 ? ctx.moveTo(xS(d), yS(pct(vals, hi))) : ctx.lineTo(xS(d), yS(pct(vals, hi)));
+      const vals = paths.map(p => p[d]).filter(isFinite);
+      const hv   = pctile(vals, hi);
+      d === 0 ? ctx.moveTo(xS(d), yS(hv)) : ctx.lineTo(xS(d), yS(hv));
     }
-    for (let d = days; d >= 0; d--) ctx.lineTo(xS(d), yS(pct(paths.map(p=>p[d]), lo)));
+    for (let d = days; d >= 0; d--) {
+      const vals = paths.map(p => p[d]).filter(isFinite);
+      ctx.lineTo(xS(d), yS(pctile(vals, lo)));
+    }
     ctx.closePath(); ctx.fillStyle = fill; ctx.fill();
   });
 
-  // Sampled paths
-  paths.filter((_,i) => i % Math.ceil(paths.length/80) === 0).forEach(path => {
-    const color = path[path.length-1] > S0 ? "rgba(0,230,118,0.1)" : "rgba(255,68,34,0.1)";
+  // Sampled paths (max 80)
+  const step = Math.max(1, Math.ceil(paths.length / 80));
+  paths.filter((_, i) => i % step === 0).forEach(path => {
+    const color = path[path.length-1] > S0 ? "rgba(0,230,118,0.09)" : "rgba(255,68,34,0.09)";
     ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = 0.8;
-    path.forEach((v,i) => i===0 ? ctx.moveTo(xS(i),yS(v)) : ctx.lineTo(xS(i),yS(v)));
+    path.forEach((v, i) => i === 0 ? ctx.moveTo(xS(i), yS(v)) : ctx.lineTo(xS(i), yS(v)));
     ctx.stroke();
   });
 
-  // Median
+  // Median path
   ctx.beginPath(); ctx.strokeStyle = "#eceef4"; ctx.lineWidth = 1.5; ctx.setLineDash([4,4]);
   for (let d = 0; d <= days; d++) {
-    const vals = paths.map(p=>p[d]).sort((a,b)=>a-b);
-    const med = vals[Math.floor(vals.length/2)];
-    d===0 ? ctx.moveTo(xS(d),yS(med)) : ctx.lineTo(xS(d),yS(med));
+    const vals = paths.map(p => p[d]).filter(isFinite).sort((a,b)=>a-b);
+    const med  = vals[Math.floor(vals.length / 2)];
+    d === 0 ? ctx.moveTo(xS(d), yS(med)) : ctx.lineTo(xS(d), yS(med));
   }
   ctx.stroke(); ctx.setLineDash([]);
 
   // S0 baseline
   ctx.beginPath(); ctx.strokeStyle = "rgba(245,200,66,0.5)"; ctx.lineWidth = 1; ctx.setLineDash([2,4]);
-  ctx.moveTo(pad.left, yS(S0)); ctx.lineTo(pad.left+cW, yS(S0)); ctx.stroke(); ctx.setLineDash([]);
+  ctx.moveTo(pad.left, yS(S0)); ctx.lineTo(pad.left + cW, yS(S0));
+  ctx.stroke(); ctx.setLineDash([]);
   ctx.fillStyle = "#f5c842"; ctx.font = "8px 'IBM Plex Mono'"; ctx.textAlign = "left";
-  ctx.fillText("$"+S0.toFixed(0), pad.left+4, yS(S0)-4);
+  ctx.fillText("$" + S0.toFixed(0), pad.left + 4, yS(S0) - 5);
 }
 
 function drawDistChart(canvas, finals, S0) {
-  if (!canvas) return;
-  const dpr = window.devicePixelRatio || 1;
+  if (!canvas || !finals || finals.length === 0) return;
+  const dpr  = window.devicePixelRatio || 1;
   const rect = canvas.parentElement.getBoundingClientRect();
-  canvas.width = rect.width * dpr;
-  canvas.height = 160 * dpr;
-  canvas.style.height = "160px";
+  const W    = Math.max(rect.width, 200);
+  canvas.width  = W * dpr;
+  canvas.height = 180 * dpr;
+  canvas.style.height = "180px";
   const ctx = canvas.getContext("2d"); ctx.scale(dpr, dpr);
-  const W = rect.width, H = 160;
-  const pad = { top: 14, right: 18, bottom: 26, left: 44 };
-  ctx.clearRect(0,0,W,H); ctx.fillStyle = "#0e1014"; ctx.fillRect(0,0,W,H);
+  const H   = 180;
+  const pad = { top:14, right:18, bottom:28, left:46 };
+  ctx.clearRect(0,0,W,H); ctx.fillStyle="#0e1014"; ctx.fillRect(0,0,W,H);
 
-  const sorted = [...finals].sort((a,b)=>a-b);
-  const min = sorted[0]*0.99, max = sorted[sorted.length-1]*1.01;
-  const bins = 40, binSize = (max-min)/bins;
-  const counts = new Array(bins).fill(0);
-  sorted.forEach(v => { const bi = Math.min(Math.floor((v-min)/binSize), bins-1); counts[bi]++; });
+  const sorted  = [...finals].filter(isFinite).sort((a,b)=>a-b);
+  if (sorted.length === 0) return;
+  const minV    = sorted[0] * 0.99;
+  const maxV    = sorted[sorted.length-1] * 1.01;
+  const bins    = 48;
+  const binSize = (maxV - minV) / bins;
+  const counts  = new Array(bins).fill(0);
+  sorted.forEach(v => {
+    const bi = Math.min(Math.floor((v - minV) / binSize), bins - 1);
+    counts[bi]++;
+  });
   const maxC = Math.max(...counts);
-  const cW = W-pad.left-pad.right, cH = H-pad.top-pad.bottom;
-  const xS = v => pad.left + ((v-min)/(max-min))*cW;
-  const yS = c => pad.top + cH - (c/maxC)*cH;
+  const cW   = W - pad.left - pad.right;
+  const cH   = H - pad.top  - pad.bottom;
+  const xS   = v => pad.left + ((v - minV) / (maxV - minV + 1e-9)) * cW;
+  const yS   = c => pad.top  + cH - (c / maxC) * cH;
 
-  counts.forEach((c,i) => {
-    const x = pad.left+(i/bins)*cW, bW = cW/bins-0.5;
-    const bc = min+(i+0.5)*binSize;
-    ctx.fillStyle = bc > S0 ? "rgba(0,230,118,0.65)" : "rgba(255,68,34,0.65)";
-    ctx.fillRect(x, yS(c), bW, cH-(yS(c)-pad.top));
+  // Bars
+  counts.forEach((c, i) => {
+    const x  = pad.left + (i / bins) * cW;
+    const bW = cW / bins - 0.5;
+    const bc = minV + (i + 0.5) * binSize;
+    ctx.fillStyle = bc > S0 ? "rgba(0,230,118,0.7)" : "rgba(255,68,34,0.65)";
+    ctx.fillRect(x, yS(c), bW, cH - (yS(c) - pad.top));
   });
 
+  // Axes
   ctx.strokeStyle = "#1a1e27"; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(pad.left,pad.top); ctx.lineTo(pad.left,pad.top+cH); ctx.lineTo(pad.left+cW,pad.top+cH); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(pad.left, pad.top); ctx.lineTo(pad.left, pad.top+cH);
+  ctx.lineTo(pad.left+cW, pad.top+cH); ctx.stroke();
 
-  [min, S0, max].forEach(v => {
-    ctx.fillStyle = "#3a4252"; ctx.font = "7px 'IBM Plex Mono'"; ctx.textAlign = "center";
+  // Labels
+  [minV, S0, maxV].forEach(v => {
+    ctx.fillStyle="#3a4252"; ctx.font="7px 'IBM Plex Mono'"; ctx.textAlign="center";
     ctx.fillText("$"+v.toFixed(0), xS(v), pad.top+cH+12);
   });
-  ctx.beginPath(); ctx.strokeStyle = "#f5c842"; ctx.lineWidth = 1.2; ctx.setLineDash([2,3]);
-  ctx.moveTo(xS(S0),pad.top); ctx.lineTo(xS(S0),pad.top+cH); ctx.stroke(); ctx.setLineDash([]);
+
+  // S0 line
+  ctx.beginPath(); ctx.strokeStyle="#f5c842"; ctx.lineWidth=1.2; ctx.setLineDash([2,3]);
+  ctx.moveTo(xS(S0), pad.top); ctx.lineTo(xS(S0), pad.top+cH); ctx.stroke(); ctx.setLineDash([]);
+
+  // VaR line
+  const var95x = pctile(finals, 5);
+  ctx.beginPath(); ctx.strokeStyle="rgba(255,68,34,0.6)"; ctx.lineWidth=1; ctx.setLineDash([3,3]);
+  ctx.moveTo(xS(var95x), pad.top); ctx.lineTo(xS(var95x), pad.top+cH); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle="var(--accent)"; ctx.font="7px 'IBM Plex Mono'"; ctx.textAlign="center";
+  ctx.fillText("VaR95", xS(var95x), pad.top+8);
+}
+
+/** NEW: draw a horizontal probability bar chart */
+function drawProbBars(canvas, stats) {
+  if (!canvas || !stats) return;
+  const dpr  = window.devicePixelRatio || 1;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const W    = Math.max(rect.width, 200);
+  canvas.width  = W * dpr;
+  canvas.height = 200 * dpr;
+  canvas.style.height = "200px";
+  const ctx = canvas.getContext("2d"); ctx.scale(dpr, dpr);
+  const H   = 200;
+  ctx.clearRect(0,0,W,H); ctx.fillStyle="#0e1014"; ctx.fillRect(0,0,W,H);
+
+  const rows = [
+    { label:"P(+15%)", val:stats.prob15up,  color:"#00e676" },
+    { label:"P(+10%)", val:stats.prob10up,  color:"#00e676" },
+    { label:"P(+5%)",  val:stats.prob5up,   color:"#4e9eff" },
+    { label:"P(Up)",   val:stats.probUp,    color: stats.probUp>50?"#00e676":"#ff4422" },
+    { label:"P(−5%)",  val:stats.prob5down, color:"#f5c842" },
+    { label:"P(−10%)", val:stats.prob10down,color:"#ff4422" },
+    { label:"P(−15%)", val:stats.prob15down,color:"#ff4422" },
+  ];
+  const rH   = H / rows.length;
+  const labW = 52;
+  const barW = W - labW - 50;
+
+  rows.forEach(({ label, val, color }, i) => {
+    const y = i * rH;
+    // label
+    ctx.fillStyle = "#6e7a8a"; ctx.font = "8px 'IBM Plex Mono'"; ctx.textAlign = "right";
+    ctx.fillText(label, labW - 6, y + rH/2 + 3);
+    // track
+    ctx.fillStyle = "#1a1e27";
+    ctx.fillRect(labW, y + rH*0.25, barW, rH*0.5);
+    // fill
+    const fw = (val / 100) * barW;
+    ctx.fillStyle = color + "cc";
+    ctx.fillRect(labW, y + rH*0.25, fw, rH*0.5);
+    // value
+    ctx.fillStyle = color; ctx.font = "9px 'IBM Plex Mono'"; ctx.textAlign = "left";
+    ctx.fillText(fmt(val,1)+"%", labW + barW + 6, y + rH/2 + 3);
+  });
 }
 
 // ─── API CALLS ────────────────────────────────────────────────────────────────
 async function fetchStockData(symbol) {
-  const url = `https://api.twelvedata.com/time_series?symbol=${symbol}&interval=1day&outputsize=90&apikey=${TD_KEY}`;
-  const res = await fetch(url);
+  const url  = `https://api.twelvedata.com/time_series?symbol=${symbol}&interval=1day&outputsize=90&apikey=${TD_KEY}`;
+  const res  = await fetch(url);
   const data = await res.json();
   if (data.status === "error") throw new Error(data.message);
-  const prices = (data.values || []).map(v => parseFloat(v.close)).reverse();
-  const latest = prices[prices.length-1];
-  const prev   = prices[prices.length-2];
-  return { prices, latest, change: ((latest-prev)/prev)*100 };
+  const prices = (data.values || []).map(v => parseFloat(v.close)).filter(isFinite).reverse();
+  if (prices.length < 2) throw new Error("Not enough price data");
+  const latest = prices[prices.length - 1];
+  const prev   = prices[prices.length - 2];
+  return { prices, latest, change: ((latest - prev) / prev) * 100 };
 }
 
 async function groqChat(prompt, maxTokens = 900) {
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_KEY}` },
-    body: JSON.stringify({ model: GROQ_MODEL, max_tokens: maxTokens, messages: [{ role:"user", content: prompt }] }),
+    headers: { "Content-Type":"application/json", Authorization:`Bearer ${GROQ_KEY}` },
+    body: JSON.stringify({ model:GROQ_MODEL, max_tokens:maxTokens, temperature:0.7,
+      messages:[{ role:"user", content:prompt }] }),
   });
+  if (!res.ok) throw new Error(`Groq API error: ${res.status}`);
   const data = await res.json();
   return data.choices?.[0]?.message?.content ?? "";
 }
 
 async function fetchGeneratedNews(symbol) {
-  const text = await groqChat(`Generate 8 realistic plausible recent news headlines (as of 2025) for ${symbol} stock. Return ONLY valid JSON array, no markdown:
-[{"title":"...","source":"...","time":"Xh ago","sentiment":<-1 to 1>,"impact":<0 to 1>},...]`);
+  const text = await groqChat(
+    `Generate 8 realistic plausible recent news headlines (as of 2025) for ${symbol} stock. ` +
+    `Return ONLY valid JSON array, no markdown:\n` +
+    `[{"title":"...","source":"...","time":"Xh ago","sentiment":<-1 to 1>,"impact":<0 to 1>},...]`
+  );
   try { return JSON.parse(text.replace(/```json|```/g,"").trim()); }
   catch { return []; }
 }
 
 async function analyzeNews(items, symbol) {
+  const fallback = { sentiment:0, sentimentAdj:0, sigmaMultiplier:1, summary:"Unavailable.", keyFactors:[], direction:"NEUTRAL", confidence:50 };
+  if (!items || items.length === 0) return fallback;
   const headlines = items.slice(0,6).map((n,i)=>`${i+1}. ${n.title}`).join("\n");
-  const text = await groqChat(`You are a quantitative analyst. Analyze these news for ${symbol}. Return ONLY valid JSON, no markdown:
-{"sentiment":<-1 to 1>,"sentimentAdj":<annualized drift float>,"sigmaMultiplier":<0.8 to 1.5>,"summary":"<2 sentences>","keyFactors":["<f1>","<f2>","<f3>"],"direction":"<BULLISH|BEARISH|NEUTRAL>","confidence":<0-100>}
-Headlines:\n${headlines}`);
-  try { return JSON.parse(text.replace(/```json|```/g,"").trim()); }
-  catch { return { sentiment:0, sentimentAdj:0, sigmaMultiplier:1, summary:"Unavailable.", keyFactors:[], direction:"NEUTRAL", confidence:50 }; }
+  try {
+    const text = await groqChat(
+      `You are a quantitative analyst. Analyze these news for ${symbol}. ` +
+      `Return ONLY valid JSON, no markdown:\n` +
+      `{"sentiment":<-1 to 1>,"sentimentAdj":<annualized drift float, e.g. 0.03>,"sigmaMultiplier":<0.8 to 1.5>,` +
+      `"summary":"<2 sentences>","keyFactors":["<f1>","<f2>","<f3>"],"direction":"<BULLISH|BEARISH|NEUTRAL>","confidence":<0-100>}\n` +
+      `Headlines:\n${headlines}`
+    );
+    const parsed = JSON.parse(text.replace(/```json|```/g,"").trim());
+    // Validate / clamp
+    parsed.sigmaMultiplier = Math.max(0.5, Math.min(2.5, parsed.sigmaMultiplier || 1));
+    parsed.sentimentAdj    = Math.max(-0.5, Math.min(0.5, parsed.sentimentAdj || 0));
+    return { ...fallback, ...parsed };
+  } catch { return fallback; }
 }
 
 // ─── ENV BANNER ───────────────────────────────────────────────────────────────
@@ -473,9 +656,8 @@ function EnvBanner() {
     <div className="env-banner">
       <h3>⚠ MISSING ENVIRONMENT VARIABLES</h3>
       <p>
-        The following keys are not set. Add them to your Vercel project under <strong>Settings → Environment Variables</strong>, then redeploy:<br /><br />
-        {missing.map(k => <span key={k}><code>{k}</code>&nbsp; </span>)}
-        <br /><br />
+        The following keys are not set. Add them to your Vercel project under <strong>Settings → Environment Variables</strong>, then redeploy:<br/><br/>
+        {missing.map(k => <span key={k}><code>{k}</code>&nbsp;</span>)}<br/><br/>
         See the <code>README.md</code> for full setup instructions.
       </p>
     </div>
@@ -485,21 +667,21 @@ function EnvBanner() {
 // ─── CLOCK ────────────────────────────────────────────────────────────────────
 function Clock() {
   const [t, setT] = useState(new Date());
-  useEffect(() => { const id = setInterval(() => setT(new Date()), 1000); return () => clearInterval(id); }, []);
+  useEffect(() => { const id = setInterval(()=>setT(new Date()),1000); return ()=>clearInterval(id); }, []);
   return <span className="nav-time">{t.toUTCString().slice(17,25)} UTC</span>;
 }
 
 // ─── PROB ARC SVG ─────────────────────────────────────────────────────────────
 function ProbArc({ value, color, size = 110 }) {
-  const r = 42, cx = 56, cy = 56;
+  const r    = 42, cx = 56, cy = 56;
   const circ = 2 * Math.PI * r;
   const dash  = (value / 100) * circ;
   return (
     <svg width={size} height={size} viewBox="0 0 112 112">
-      <circle cx={cx} cy={cy} r={r} fill="none" stroke="#1a1e27" strokeWidth="7" />
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke="#1a1e27" strokeWidth="7"/>
       <circle cx={cx} cy={cy} r={r} fill="none" stroke={color} strokeWidth="7"
-        strokeDasharray={`${dash} ${circ - dash}`} strokeLinecap="round"
-        transform={`rotate(-90 ${cx} ${cy})`} style={{ transition: "stroke-dasharray 1.2s ease" }} />
+        strokeDasharray={`${dash} ${circ-dash}`} strokeLinecap="round"
+        transform={`rotate(-90 ${cx} ${cy})`} style={{ transition:"stroke-dasharray 1.2s ease" }}/>
       <text x={cx} y={cy+6} textAnchor="middle" fill={color} fontSize="14" fontWeight="700" fontFamily="IBM Plex Mono">
         {Math.round(value)}%
       </text>
@@ -509,7 +691,7 @@ function ProbArc({ value, color, size = 110 }) {
 
 // ─── PAGE: NEWS ───────────────────────────────────────────────────────────────
 function NewsPage({ symbol, stockData }) {
-  const [news, setNews] = useState([]);
+  const [news, setNews]       = useState([]);
   const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
 
@@ -520,7 +702,7 @@ function NewsPage({ symbol, stockData }) {
       setNews(items);
       const anal  = await analyzeNews(items, symbol);
       setAnalysis(anal);
-    } catch(e) { console.error(e); }
+    } catch(e) { console.error("NewsPage error:", e); }
     setLoading(false);
   }, [symbol]);
 
@@ -531,7 +713,7 @@ function NewsPage({ symbol, stockData }) {
   const sentTagCls = s => s > 0.2 ? "tag-bull" : s < -0.2 ? "tag-bear" : "tag-neutral";
 
   return (
-    <div style={{ padding: "24px 36px", flex: 1 }}>
+    <div style={{ padding:"24px 36px", flex:1 }}>
       <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", marginBottom:24 }}>
         <div>
           <div className="section-label" style={{ borderBottom:"none", padding:0, margin:0, marginBottom:6 }}>NEWS INTELLIGENCE / {symbol}</div>
@@ -554,7 +736,7 @@ function NewsPage({ symbol, stockData }) {
           ) : (
             <div className="scroll-area">
               {news.map((item, i) => (
-                <div className="news-item" key={i} style={{ animationDelay: `${i * 0.05}s` }}>
+                <div className="news-item" key={i} style={{ animationDelay:`${i*0.05}s` }}>
                   <div className="news-meta">
                     <span className="news-source">{item.source?.toUpperCase()}</span>
                     <span style={{ color:"var(--border2)" }}>·</span>
@@ -565,7 +747,7 @@ function NewsPage({ symbol, stockData }) {
                   <div style={{ display:"flex", alignItems:"center", gap:8, marginTop:10 }}>
                     <span style={{ fontSize:8, color:"var(--text3)", width:48 }}>IMPACT</span>
                     <div className="impact-bar-wrap">
-                      <div className="impact-bar" style={{ width:`${(item.impact||0.5)*100}%`, background:sentColor(item.sentiment) }} />
+                      <div className="impact-bar" style={{ width:`${(item.impact||0.5)*100}%`, background:sentColor(item.sentiment) }}/>
                     </div>
                     <span style={{ fontSize:9, color:"var(--text2)", width:28 }}>{Math.round((item.impact||0.5)*100)}%</span>
                   </div>
@@ -582,14 +764,15 @@ function NewsPage({ symbol, stockData }) {
             {analysis ? (
               <>
                 <div style={{ textAlign:"center", padding:"16px 0 12px" }}>
-                  <div style={{ fontSize:24, fontWeight:800, color: analysis.direction==="BULLISH"?"var(--green)":analysis.direction==="BEARISH"?"var(--accent)":"var(--yellow)", letterSpacing:"-0.02em" }}>
+                  <div style={{ fontSize:24, fontWeight:800, letterSpacing:"-0.02em",
+                    color: analysis.direction==="BULLISH"?"var(--green)":analysis.direction==="BEARISH"?"var(--accent)":"var(--yellow)" }}>
                     {analysis.direction}
                   </div>
                   <div style={{ fontSize:10, color:"var(--text2)", marginTop:4 }}>{analysis.confidence}% confidence</div>
                   <div style={{ marginTop:10, height:3, background:"var(--border)", borderRadius:2, overflow:"hidden" }}>
                     <div style={{ width:`${analysis.confidence}%`, height:"100%", borderRadius:2,
                       background: analysis.direction==="BULLISH"?"var(--green)":analysis.direction==="BEARISH"?"var(--accent)":"var(--yellow)",
-                      transition:"width 1s ease" }} />
+                      transition:"width 1s ease" }}/>
                   </div>
                 </div>
                 <div style={{ fontSize:11, color:"var(--text2)", lineHeight:1.7, marginBottom:14, fontFamily:"var(--sans)" }}>{analysis.summary}</div>
@@ -608,9 +791,9 @@ function NewsPage({ symbol, stockData }) {
             {analysis ? (
               <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
                 {[
-                  { label:"Sentiment Score",  value: fmt(analysis.sentiment,3),                                          color: sentColor(analysis.sentiment) },
-                  { label:"Drift Adj (ann.)", value: fmtPct(analysis.sentimentAdj*100),                                  color: analysis.sentimentAdj>=0?"var(--green)":"var(--accent)" },
-                  { label:"Vol Multiplier",   value: fmt(analysis.sigmaMultiplier,2)+"×",                                color: "var(--text)" },
+                  { label:"Sentiment Score",  value:fmt(analysis.sentiment,3),           color:sentColor(analysis.sentiment) },
+                  { label:"Drift Adj (ann.)", value:fmtPct(analysis.sentimentAdj*100),   color:analysis.sentimentAdj>=0?"var(--green)":"var(--accent)" },
+                  { label:"Vol Multiplier",   value:fmt(analysis.sigmaMultiplier,2)+"×", color:"var(--text)" },
                 ].map(({label,value,color}) => (
                   <div key={label} style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
                     <span style={{ fontSize:9, color:"var(--text2)" }}>{label}</span>
@@ -636,8 +819,8 @@ function NewsPage({ symbol, stockData }) {
 
 // ─── PAGE: SIMULATION ─────────────────────────────────────────────────────────
 function SimulationPage({ symbol, stockData }) {
-  const mcCanvas   = useRef(null);
-  const distCanvas = useRef(null);
+  const mcCanvasRef   = useRef(null);
+  const distCanvasRef = useRef(null);
   const [paths, setPaths]   = useState(null);
   const [days, setDays]     = useState(30);
   const [gbm, setGbm]       = useState(null);
@@ -645,11 +828,12 @@ function SimulationPage({ symbol, stockData }) {
   const [stats, setStats]   = useState(null);
   const [aiAdj, setAiAdj]   = useState(null);
   const [loading, setLoading] = useState(false);
-  const [ran, setRan]       = useState(false);
+  const [ran, setRan]         = useState(false);
+  const [error, setError]     = useState(null);
 
   useEffect(() => {
     if (stockData?.prices?.length > 1) {
-      const g  = estimateGBM(stockData.prices);
+      const g = estimateGBM(stockData.prices);
       setGbm(g);
       setMarkov(buildMarkovMatrix(g.returns));
     }
@@ -657,34 +841,49 @@ function SimulationPage({ symbol, stockData }) {
 
   const runSim = useCallback(async () => {
     if (!gbm || !stockData) return;
-    setLoading(true);
+    setLoading(true); setError(null);
     let adj = { sentimentAdj:0, sigmaMultiplier:1 };
     try {
       const news = await fetchGeneratedNews(symbol);
       adj = await analyzeNews(news, symbol);
       setAiAdj(adj);
-    } catch {}
-    const S0    = stockData.latest;
-    const sigma = gbm.sigma * (adj.sigmaMultiplier || 1);
-    const newPaths = runMonteCarlo({ S0, mu:gbm.mu, sigma, days, n:600, sentimentAdj:adj.sentimentAdj||0 });
-    setPaths(newPaths);
-    const finals = newPaths.map(p=>p[p.length-1]);
-    const sorted = [...finals].sort((a,b)=>a-b);
-    const above  = finals.filter(f=>f>S0).length;
-    setStats({
-      probUp: (above/finals.length)*100,
-      median: sorted[Math.floor(sorted.length/2)],
-      p10: sorted[Math.floor(0.1*sorted.length)],
-      p90: sorted[Math.floor(0.9*sorted.length)],
-      var95: calcVaR(finals,S0,0.95),
-      sharpe: calcSharpe(gbm.mu, gbm.sigma * (adj.sigmaMultiplier||1)),
-      S0, finals,
-    });
-    setLoading(false); setRan(true);
+    } catch(e) { console.warn("AI adj skipped:", e.message); }
+    try {
+      const S0    = stockData.latest;
+      const sigma = gbm.sigma * (adj.sigmaMultiplier || 1);
+      const newPaths = runMonteCarlo({ S0, mu:gbm.mu, sigma, days, n:600, sentimentAdj:adj.sentimentAdj||0 });
+      if (newPaths.length === 0) throw new Error("Monte Carlo produced 0 paths — check GBM parameters.");
+      setPaths(newPaths);
+      const finals = newPaths.map(p=>p[p.length-1]);
+      setStats(computeStats(finals, S0, gbm, adj));
+      setRan(true);
+    } catch(e) {
+      console.error("Simulation error:", e);
+      setError(e.message);
+    }
+    setLoading(false);
   }, [gbm, stockData, days, symbol]);
 
-  useEffect(() => { if (paths && mcCanvas.current)   drawMCChart(mcCanvas.current, paths, days, stockData.latest); }, [paths, days, stockData]);
-  useEffect(() => { if (stats && distCanvas.current) drawDistChart(distCanvas.current, stats.finals, stats.S0); }, [stats]);
+  // FIX: draw only after layout is ready via ResizeObserver
+  useEffect(() => {
+    if (!paths || !mcCanvasRef.current) return;
+    const draw = () => drawMCChart(mcCanvasRef.current, paths, days, stockData.latest);
+    const el   = mcCanvasRef.current.parentElement;
+    if (el.getBoundingClientRect().width > 0) { draw(); return; }
+    const ro = new ResizeObserver(() => { if (el.getBoundingClientRect().width > 0) { ro.disconnect(); draw(); } });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [paths, days, stockData]);
+
+  useEffect(() => {
+    if (!stats || !distCanvasRef.current) return;
+    const draw = () => drawDistChart(distCanvasRef.current, stats.finals, stats.S0);
+    const el   = distCanvasRef.current.parentElement;
+    if (el.getBoundingClientRect().width > 0) { draw(); return; }
+    const ro = new ResizeObserver(() => { if (el.getBoundingClientRect().width > 0) { ro.disconnect(); draw(); } });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [stats]);
 
   const stateLabels = ["BEAR","NEUTRAL","BULL"];
   const stateColors = ["var(--accent)","var(--yellow)","var(--green)"];
@@ -694,17 +893,17 @@ function SimulationPage({ symbol, stockData }) {
       <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", marginBottom:24 }}>
         <div>
           <div className="section-label" style={{ borderBottom:"none", padding:0, margin:0, marginBottom:6 }}>MONTE CARLO SIMULATION / {symbol}</div>
-          <div style={{ fontSize:10, color:"var(--text2)" }}>GBM + Markov regime transitions + AI-adjusted drift & volatility</div>
+          <div style={{ fontSize:10, color:"var(--text2)" }}>GBM + Markov regime transitions + AI-adjusted drift &amp; volatility · 600 paths</div>
         </div>
         <div style={{ display:"flex", gap:10, alignItems:"center" }}>
           <div style={{ display:"flex", gap:4, alignItems:"center" }}>
             <span style={{ fontSize:8, color:"var(--text3)", marginRight:4 }}>HORIZON</span>
             {[7,14,30,60,90].map(d => (
               <button key={d} className="btn btn-outline" style={{ padding:"5px 10px", fontSize:"8px",
-                background: days===d?"var(--surface2)":"transparent",
-                color: days===d?"var(--text)":"var(--text3)",
-                borderColor: days===d?"var(--border2)":"var(--border)" }}
-                onClick={() => setDays(d)}>{d}D</button>
+                background:days===d?"var(--surface2)":"transparent",
+                color:days===d?"var(--text)":"var(--text3)",
+                borderColor:days===d?"var(--border2)":"var(--border)" }}
+                onClick={()=>setDays(d)}>{d}D</button>
             ))}
           </div>
           <button className="btn btn-accent" onClick={runSim} disabled={loading||!gbm}>
@@ -717,10 +916,11 @@ function SimulationPage({ symbol, stockData }) {
       {gbm && (
         <div className="grid-4" style={{ marginBottom:20 }}>
           {[
-            { label:"Annualized Drift (μ)", value:fmtPct(gbm.mu*100), color:colorChg(gbm.mu) },
-            { label:"Annualized Vol (σ)",   value:fmt(gbm.sigma*100)+"%", color:"var(--text)" },
-            { label:"Current Price",        value:"$"+fmt(stockData?.latest), color:"var(--text)" },
-            { label:"Sharpe Estimate",      value:fmt(calcSharpe(gbm.mu, gbm.sigma),2), color: calcSharpe(gbm.mu,gbm.sigma)>1?"var(--green)": calcSharpe(gbm.mu,gbm.sigma)>0?"var(--yellow)":"var(--accent)" },
+            { label:"Annualized Drift (μ)",  value:fmtPct(gbm.mu*100),              color:colorChg(gbm.mu) },
+            { label:"Annualized Vol (σ)",    value:fmt(gbm.sigma*100,1)+"%",         color:"var(--text)" },
+            { label:"Current Price",         value:"$"+fmt(stockData?.latest),       color:"var(--text)" },
+            { label:"Sharpe Estimate",       value:fmt(calcSharpe(gbm.mu,gbm.sigma),2),
+              color:calcSharpe(gbm.mu,gbm.sigma)>1?"var(--green)":calcSharpe(gbm.mu,gbm.sigma)>0?"var(--yellow)":"var(--accent)" },
           ].map(({label,value,color}) => (
             <div key={label} className="card card-sm">
               <div className="stat-label">{label}</div>
@@ -730,7 +930,13 @@ function SimulationPage({ symbol, stockData }) {
         </div>
       )}
 
-      {!ran && !loading && (
+      {error && (
+        <div style={{ padding:"14px 20px", marginBottom:16, background:"rgba(255,68,34,0.07)", border:"1px solid rgba(255,68,34,0.2)", borderRadius:6, fontSize:10, color:"var(--accent)" }}>
+          ⚠ {error}
+        </div>
+      )}
+
+      {!ran && !loading && !error && (
         <div style={{ display:"flex", alignItems:"center", justifyContent:"center", height:260, border:"1px dashed var(--border)", borderRadius:8, color:"var(--text3)", fontSize:10, letterSpacing:"0.12em", flexDirection:"column", gap:10 }}>
           <span style={{ fontSize:20 }}>⟳</span>
           SELECT HORIZON AND PRESS RUN SIM
@@ -740,14 +946,14 @@ function SimulationPage({ symbol, stockData }) {
       {loading && (
         <div style={{ display:"flex", alignItems:"center", justifyContent:"center", height:260, border:"1px solid var(--border)", borderRadius:8, flexDirection:"column", gap:16 }}>
           <div className="loader-dots"><span/><span/><span/></div>
-          <span style={{ fontSize:10, color:"var(--text3)" }}>Running 600 Monte Carlo paths…</span>
+          <span style={{ fontSize:10, color:"var(--text3)" }}>Running 600 Monte Carlo paths + AI sentiment…</span>
         </div>
       )}
 
       {ran && !loading && paths && (
         <div style={{ display:"flex", flexDirection:"column", gap:18 }}>
           <div className="card" style={{ padding:"14px 18px" }}>
-            <div style={{ display:"flex", justifyContent:"space-between", marginBottom:10 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", marginBottom:10, flexWrap:"wrap", gap:8 }}>
               <div className="section-label" style={{ borderBottom:"none", padding:0, margin:0 }}>PRICE PATHS — {days}D · 600 SIMULATIONS</div>
               <div style={{ display:"flex", gap:14, flexWrap:"wrap" }}>
                 {[["rgba(0,230,118,0.7)","Bull paths"],["rgba(255,68,34,0.7)","Bear paths"],["#eceef4","Median"],["rgba(78,158,255,0.5)","25–75%ile"]].map(([c,l])=>(
@@ -755,16 +961,17 @@ function SimulationPage({ symbol, stockData }) {
                 ))}
               </div>
             </div>
-            <div className="chart-wrap"><canvas ref={mcCanvas}/></div>
+            <div className="chart-wrap"><canvas ref={mcCanvasRef}/></div>
           </div>
 
           <div className="grid-2">
             <div className="card">
               <div className="section-label">DISTRIBUTION OF FINAL PRICES</div>
-              <div className="chart-wrap"><canvas ref={distCanvas}/></div>
-              <div style={{ display:"flex", gap:12, marginTop:10 }}>
+              <div className="chart-wrap"><canvas ref={distCanvasRef}/></div>
+              <div style={{ display:"flex", gap:14, marginTop:10, flexWrap:"wrap" }}>
                 <div className="legend-item"><div className="legend-dot" style={{ background:"var(--green)" }}/>Above entry</div>
                 <div className="legend-item"><div className="legend-dot" style={{ background:"var(--accent)" }}/>Below entry</div>
+                <div className="legend-item"><div className="legend-dot" style={{ background:"var(--yellow)" }}/>VaR 95%</div>
               </div>
             </div>
 
@@ -773,14 +980,18 @@ function SimulationPage({ symbol, stockData }) {
                 <div className="card">
                   <div className="section-label">STATISTICAL SUMMARY</div>
                   {[
-                    { label:"P(Price Goes Up)",    value:fmt(stats.probUp,1)+"%",  color:stats.probUp>50?"var(--green)":"var(--accent)", big:true },
-                    { label:"Median Target",       value:"$"+fmt(stats.median),     color:colorChg(stats.median-stats.S0) },
-                    { label:"10th Percentile",     value:"$"+fmt(stats.p10),        color:"var(--accent)" },
-                    { label:"90th Percentile",     value:"$"+fmt(stats.p90),        color:"var(--green)" },
-                    { label:"VaR 95% (max loss)",  value:fmt(stats.var95,1)+"%",    color:"var(--accent)" },
-                    { label:"Sharpe (est.)",       value:fmt(stats.sharpe,2),       color:stats.sharpe>1?"var(--green)":stats.sharpe>0?"var(--yellow)":"var(--accent)" },
+                    { label:"P(Price Goes Up)",   value:fmt(stats.probUp,1)+"%",     color:stats.probUp>50?"var(--green)":"var(--accent)", big:true },
+                    { label:"Median Target",       value:"$"+fmt(stats.median),       color:colorChg(stats.median-stats.S0) },
+                    { label:"Expected Return",     value:fmtPct(stats.expectedReturn),color:colorChg(stats.expectedReturn) },
+                    { label:"5th Percentile",      value:"$"+fmt(stats.p5),           color:"var(--accent)" },
+                    { label:"25th Percentile",     value:"$"+fmt(stats.p25),          color:"var(--text2)" },
+                    { label:"75th Percentile",     value:"$"+fmt(stats.p75),          color:"var(--text2)" },
+                    { label:"95th Percentile",     value:"$"+fmt(stats.p95),          color:"var(--green)" },
+                    { label:"VaR 95%",             value:fmt(stats.var95,1)+"%",      color:"var(--accent)" },
+                    { label:"VaR 99%",             value:fmt(stats.var99,1)+"%",      color:"var(--accent)" },
+                    { label:"Sharpe (est.)",        value:fmt(stats.sharpe,2),         color:stats.sharpe>1?"var(--green)":stats.sharpe>0?"var(--yellow)":"var(--accent)" },
                   ].map(({label,value,color,big}) => (
-                    <div key={label} style={{ display:"flex", justifyContent:"space-between", padding:"8px 0", borderBottom:"1px solid var(--border)" }}>
+                    <div key={label} style={{ display:"flex", justifyContent:"space-between", padding:"7px 0", borderBottom:"1px solid var(--border)" }}>
                       <span style={{ fontSize:9, color:"var(--text2)" }}>{label}</span>
                       <span style={{ fontSize:big?16:11, fontWeight:big?800:600, color }}>{value}</span>
                     </div>
@@ -791,19 +1002,19 @@ function SimulationPage({ symbol, stockData }) {
               {markov && (
                 <div className="card">
                   <div className="section-label">MARKOV TRANSITION MATRIX</div>
-                  <div style={{ fontSize:8, color:"var(--text3)", marginBottom:10 }}>Bear / Neutral / Bull regime transitions</div>
+                  <div style={{ fontSize:8, color:"var(--text3)", marginBottom:10 }}>Bear / Neutral / Bull regime probabilities</div>
                   <table style={{ width:"100%", borderCollapse:"collapse" }}>
                     <thead>
                       <tr>
-                        <td style={{ fontSize:8, color:"var(--text3)", padding:"3px 6px" }}>FROM\TO</td>
-                        {stateLabels.map((l,j)=><th key={j} style={{ fontSize:8, fontWeight:700, color:stateColors[j], padding:"3px 6px", textAlign:"right" }}>{l}</th>)}
+                        <td style={{ fontSize:8, color:"var(--text3)", padding:"3px 6px" }}>FROM \ TO</td>
+                        {stateLabels.map((l,j) => <th key={j} style={{ fontSize:8, fontWeight:700, color:stateColors[j], padding:"3px 6px", textAlign:"right" }}>{l}</th>)}
                       </tr>
                     </thead>
                     <tbody>
-                      {markov.map((row,i)=>(
+                      {markov.map((row,i) => (
                         <tr key={i}>
                           <td style={{ fontSize:9, color:stateColors[i], padding:"5px 6px", fontWeight:700 }}>{stateLabels[i]}</td>
-                          {row.map((v,j)=>(
+                          {row.map((v,j) => (
                             <td key={j} style={{ fontSize:10, color:i===j?"var(--text)":"var(--text2)", padding:"5px 6px", textAlign:"right", fontWeight:i===j?700:400 }}>
                               {fmt(v*100,1)}%
                             </td>
@@ -835,43 +1046,68 @@ function SimulationPage({ symbol, stockData }) {
 
 // ─── PAGE: PROBABILITY ────────────────────────────────────────────────────────
 function ProbabilityPage({ symbol, stockData }) {
+  const probCanvasRef = useRef(null);
+  const distCanvasRef = useRef(null);
   const [result, setResult]   = useState(null);
   const [loading, setLoading] = useState(false);
   const [horizon, setHorizon] = useState(30);
+  const [error, setError]     = useState(null);
 
   const analyze = useCallback(async () => {
     if (!stockData) return;
-    setLoading(true);
+    setLoading(true); setError(null); setResult(null);
     try {
-      const news  = await fetchGeneratedNews(symbol);
+      // Parallel: fetch news and estimate GBM simultaneously
+      const [news, gbm] = await Promise.all([
+        fetchGeneratedNews(symbol).catch(() => []),
+        Promise.resolve(estimateGBM(stockData.prices)),
+      ]);
       const adj   = await analyzeNews(news, symbol);
-      const gbm   = estimateGBM(stockData.prices);
       const S0    = stockData.latest;
-      const sigma = gbm.sigma * (adj.sigmaMultiplier||1);
+      const sigma = gbm.sigma * (adj.sigmaMultiplier || 1);
+
+      if (!isFinite(S0) || S0 <= 0) throw new Error("Invalid stock price — try a different symbol.");
+      if (!isFinite(sigma) || sigma <= 0) throw new Error("Could not estimate volatility from price history.");
+
       const paths = runMonteCarlo({ S0, mu:gbm.mu, sigma, days:horizon, n:1000, sentimentAdj:adj.sentimentAdj||0 });
-      const finals = paths.map(p=>p[p.length-1]);
-      const sorted = [...finals].sort((a,b)=>a-b);
-      const median = sorted[Math.floor(sorted.length/2)];
-      setResult({
-        probUp:    (finals.filter(f=>f>S0).length/finals.length)*100,
-        prob5up:   (finals.filter(f=>f>S0*1.05).length/finals.length)*100,
-        prob10up:  (finals.filter(f=>f>S0*1.10).length/finals.length)*100,
-        prob5down: (finals.filter(f=>f<S0*0.95).length/finals.length)*100,
-        prob10down:(finals.filter(f=>f<S0*0.90).length/finals.length)*100,
-        median, var95:calcVaR(finals,S0,0.95),
-        expectedReturn:((median-S0)/S0)*100,
-        sharpe: calcSharpe(gbm.mu, sigma),
-        adj, gbm, S0,
-      });
-    } catch(e) { console.error(e); }
+      if (paths.length === 0) throw new Error("Simulation produced no paths.");
+
+      const finals = paths.map(p => p[p.length-1]);
+      setResult({ ...computeStats(finals, S0, gbm, adj), paths });
+    } catch(e) {
+      console.error("ProbabilityPage error:", e);
+      setError(e.message || "Analysis failed. Check your API keys and symbol.");
+    }
     setLoading(false);
   }, [symbol, stockData, horizon]);
 
+  // Draw probability bar canvas
+  useEffect(() => {
+    if (!result || !probCanvasRef.current) return;
+    const draw = () => drawProbBars(probCanvasRef.current, result);
+    const el   = probCanvasRef.current.parentElement;
+    if (el.getBoundingClientRect().width > 0) { draw(); return; }
+    const ro = new ResizeObserver(() => { if (el.getBoundingClientRect().width > 0) { ro.disconnect(); draw(); } });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [result]);
+
+  // Draw distribution canvas
+  useEffect(() => {
+    if (!result || !distCanvasRef.current) return;
+    const draw = () => drawDistChart(distCanvasRef.current, result.finals, result.S0);
+    const el   = distCanvasRef.current.parentElement;
+    if (el.getBoundingClientRect().width > 0) { draw(); return; }
+    const ro = new ResizeObserver(() => { if (el.getBoundingClientRect().width > 0) { ro.disconnect(); draw(); } });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [result]);
+
   const verdict = result
-    ? result.probUp > 60 ? { text:"STRONG BUY",   color:"var(--green)" }
-    : result.probUp > 52 ? { text:"MILD BULLISH", color:"var(--green)" }
-    : result.probUp < 40 ? { text:"STRONG BEAR",  color:"var(--accent)" }
-    : result.probUp < 48 ? { text:"MILD BEARISH", color:"var(--accent)" }
+    ? result.probUp > 62 ? { text:"STRONG BUY",   color:"var(--green)" }
+    : result.probUp > 54 ? { text:"MILD BULLISH", color:"var(--green)" }
+    : result.probUp < 38 ? { text:"STRONG BEAR",  color:"var(--accent)" }
+    : result.probUp < 46 ? { text:"MILD BEARISH", color:"var(--accent)" }
     :                      { text:"NEUTRAL",       color:"var(--yellow)" }
     : null;
 
@@ -880,12 +1116,12 @@ function ProbabilityPage({ symbol, stockData }) {
       <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", marginBottom:24 }}>
         <div>
           <div className="section-label" style={{ borderBottom:"none", padding:0, margin:0, marginBottom:6 }}>PROBABILITY DASHBOARD / {symbol}</div>
-          <div style={{ fontSize:10, color:"var(--text2)" }}>Full-stack probabilistic verdict with risk metrics · 1000-path MC</div>
+          <div style={{ fontSize:10, color:"var(--text2)" }}>Full probabilistic forecast · 1000-path GBM + Markov + AI sentiment</div>
         </div>
         <div style={{ display:"flex", gap:10, alignItems:"center" }}>
           <div style={{ display:"flex", gap:4 }}>
             <span style={{ fontSize:8, color:"var(--text3)", alignSelf:"center", marginRight:4 }}>HORIZON</span>
-            {[7,14,30,60,90].map(d=>(
+            {[7,14,30,60,90].map(d => (
               <button key={d} className="btn btn-outline" style={{ padding:"5px 10px", fontSize:"8px",
                 background:horizon===d?"var(--surface2)":"transparent",
                 color:horizon===d?"var(--text)":"var(--text3)",
@@ -899,7 +1135,13 @@ function ProbabilityPage({ symbol, stockData }) {
         </div>
       </div>
 
-      {!result && !loading && (
+      {error && (
+        <div style={{ padding:"14px 20px", marginBottom:16, background:"rgba(255,68,34,0.07)", border:"1px solid rgba(255,68,34,0.2)", borderRadius:6, fontSize:10, color:"var(--accent)" }}>
+          ⚠ {error}
+        </div>
+      )}
+
+      {!result && !loading && !error && (
         <div style={{ display:"flex", alignItems:"center", justifyContent:"center", height:320, border:"1px dashed var(--border)", borderRadius:8, color:"var(--text3)", fontSize:10, letterSpacing:"0.12em", flexDirection:"column", gap:10 }}>
           <span style={{ fontSize:20 }}>◎</span>
           PRESS ANALYZE TO GENERATE FORECAST
@@ -909,25 +1151,32 @@ function ProbabilityPage({ symbol, stockData }) {
       {loading && (
         <div style={{ display:"flex", alignItems:"center", justifyContent:"center", height:320, flexDirection:"column", gap:18, border:"1px solid var(--border)", borderRadius:8 }}>
           <div className="loader-dots"><span/><span/><span/></div>
-          <span style={{ fontSize:10, color:"var(--text3)" }}>Running 1000-path Monte Carlo analysis…</span>
+          <span style={{ fontSize:10, color:"var(--text3)" }}>Running 1000-path Monte Carlo + AI sentiment analysis…</span>
         </div>
       )}
 
       {result && !loading && (
         <div style={{ display:"flex", flexDirection:"column", gap:18 }}>
-          {/* Verdict banner */}
+
+          {/* ── Verdict Banner ── */}
           <div className="card" style={{ padding:"24px 28px", position:"relative", overflow:"hidden" }}>
-            <div style={{ position:"absolute", inset:0, background:`radial-gradient(ellipse at 75% 50%, ${result.probUp>50?"rgba(0,230,118,0.04)":"rgba(255,68,34,0.04)"} 0%, transparent 65%)`, pointerEvents:"none" }} />
+            <div style={{ position:"absolute", inset:0,
+              background:`radial-gradient(ellipse at 75% 50%, ${result.probUp>50?"rgba(0,230,118,0.04)":"rgba(255,68,34,0.04)"} 0%, transparent 65%)`,
+              pointerEvents:"none" }}/>
             <div style={{ display:"flex", alignItems:"center", gap:32, flexWrap:"wrap" }}>
               <ProbArc value={result.probUp} color={result.probUp>50?"var(--green)":"var(--accent)"} size={120}/>
               <div style={{ flex:1, minWidth:200 }}>
                 <div style={{ fontSize:8, letterSpacing:"0.2em", color:"var(--text3)", marginBottom:8 }}>OVERALL SIGNAL · {horizon}D HORIZON</div>
                 <div style={{ fontSize:28, fontWeight:800, color:verdict.color, letterSpacing:"-0.03em", marginBottom:8 }}>{verdict.text}</div>
                 <div style={{ fontSize:11, color:"var(--text2)", fontFamily:"var(--sans)", lineHeight:1.65, maxWidth:400 }}>
-                  Based on GBM calibrated on 90d history, Markov regime analysis, and Groq AI news sentiment — <strong style={{ color:verdict.color }}>{Math.round(result.probUp)}% probability</strong> {symbol} closes higher in {horizon} days.
+                  GBM + Markov regime + Groq AI sentiment —{" "}
+                  <strong style={{ color:verdict.color }}>{Math.round(result.probUp)}% probability</strong>{" "}
+                  {symbol} closes higher in {horizon} days.
                 </div>
                 <div style={{ marginTop:10, display:"flex", gap:8, flexWrap:"wrap" }}>
-                  <span className={`tag tag-${result.adj?.direction==="BULLISH"?"bull":result.adj?.direction==="BEARISH"?"bear":"neutral"}`}>NEWS: {result.adj?.direction}</span>
+                  <span className={`tag tag-${result.adj?.direction==="BULLISH"?"bull":result.adj?.direction==="BEARISH"?"bear":"neutral"}`}>
+                    NEWS: {result.adj?.direction}
+                  </span>
                   <span style={{ fontSize:9, color:"var(--text3)", alignSelf:"center" }}>AI confidence: {result.adj?.confidence}%</span>
                   <span style={{ fontSize:9, color:"var(--text3)", alignSelf:"center" }}>Sharpe: {fmt(result.sharpe,2)}</span>
                 </div>
@@ -936,6 +1185,7 @@ function ProbabilityPage({ symbol, stockData }) {
                 <div>
                   <div className="stat-label">MEDIAN TARGET</div>
                   <div style={{ fontSize:22, fontWeight:800, color:colorChg(result.median-result.S0), fontVariantNumeric:"tabular-nums" }}>${fmt(result.median)}</div>
+                  <div style={{ fontSize:9, color:"var(--text3)", marginTop:2 }}>{fmtPct(result.medianReturn)}</div>
                 </div>
                 <div>
                   <div className="stat-label">EXPECTED RETURN</div>
@@ -945,14 +1195,14 @@ function ProbabilityPage({ symbol, stockData }) {
             </div>
           </div>
 
-          {/* Prob arcs */}
+          {/* ── Prob Arcs Row ── */}
           <div className="grid-5">
             {[
-              { label:"P(+10%)",  value:result.prob10up,  color:"var(--green)" },
-              { label:"P(+5%)",   value:result.prob5up,   color:"var(--green)" },
-              { label:"P(Up)",    value:result.probUp,    color:result.probUp>50?"var(--green)":"var(--accent)" },
-              { label:"P(−5%)",   value:result.prob5down, color:"var(--accent)" },
-              { label:"P(−10%)",  value:result.prob10down,color:"var(--accent)" },
+              { label:"P(+15%)", value:result.prob15up,  color:"var(--green)" },
+              { label:"P(+10%)", value:result.prob10up,  color:"var(--green)" },
+              { label:"P(Up)",   value:result.probUp,    color:result.probUp>50?"var(--green)":"var(--accent)" },
+              { label:"P(−10%)", value:result.prob10down,color:"var(--accent)" },
+              { label:"P(−15%)", value:result.prob15down,color:"var(--accent)" },
             ].map(({label,value,color}) => (
               <div key={label} className="card" style={{ textAlign:"center", padding:"18px 8px" }}>
                 <div className="prob-arc-wrap">
@@ -964,17 +1214,35 @@ function ProbabilityPage({ symbol, stockData }) {
             ))}
           </div>
 
-          {/* Risk + Methodology */}
+          {/* ── Probability Bar Chart + Distribution ── */}
+          <div className="grid-2">
+            <div className="card">
+              <div className="section-label">PROBABILITY PROFILE</div>
+              <div className="chart-wrap"><canvas ref={probCanvasRef}/></div>
+            </div>
+            <div className="card">
+              <div className="section-label">FINAL PRICE DISTRIBUTION · 1000 PATHS</div>
+              <div className="chart-wrap"><canvas ref={distCanvasRef}/></div>
+              <div style={{ display:"flex", gap:12, marginTop:10, flexWrap:"wrap" }}>
+                <div className="legend-item"><div className="legend-dot" style={{ background:"var(--green)" }}/>Above entry</div>
+                <div className="legend-item"><div className="legend-dot" style={{ background:"var(--accent)" }}/>Below entry</div>
+                <div className="legend-item"><div className="legend-dot" style={{ background:"var(--yellow)" }}/>VaR 95%</div>
+              </div>
+            </div>
+          </div>
+
+          {/* ── Risk Metrics + Percentile Table ── */}
           <div className="grid-2">
             <div className="card">
               <div className="section-label">RISK METRICS</div>
               {[
-                { label:"VaR 95% (worst case)",  value:fmt(result.var95,1)+"%",                        color:"var(--accent)" },
-                { label:"Annualized Vol (σ)",     value:fmt(result.gbm?.sigma*100,1)+"%",              color:"var(--text)" },
-                { label:"Annualized Drift (μ)",   value:fmtPct(result.gbm?.mu*100),                   color:colorChg(result.gbm?.mu) },
+                { label:"VaR 95% (worst case)",  value:fmt(result.var95,1)+"%",                          color:"var(--accent)" },
+                { label:"VaR 99% (tail risk)",   value:fmt(result.var99,1)+"%",                          color:"var(--accent)" },
+                { label:"Annualized Vol (σ)",     value:fmt(result.gbm?.sigma*100,1)+"%",                 color:"var(--text)" },
+                { label:"Annualized Drift (μ)",   value:fmtPct(result.gbm?.mu*100),                      color:colorChg(result.gbm?.mu) },
                 { label:"AI Drift Adjustment",    value:(result.adj?.sentimentAdj>=0?"+":"")+fmt(result.adj?.sentimentAdj*100,2)+"%/yr", color:colorChg(result.adj?.sentimentAdj) },
-                { label:"Vol Multiplier",         value:fmt(result.adj?.sigmaMultiplier,2)+"×",       color:"var(--text)" },
-                { label:"Sharpe Ratio (est.)",    value:fmt(result.sharpe,2),                          color:result.sharpe>1?"var(--green)":result.sharpe>0?"var(--yellow)":"var(--accent)" },
+                { label:"Vol Multiplier (AI)",    value:fmt(result.adj?.sigmaMultiplier,2)+"×",           color:"var(--text)" },
+                { label:"Sharpe Ratio (est.)",    value:fmt(result.sharpe,2),                             color:result.sharpe>1?"var(--green)":result.sharpe>0?"var(--yellow)":"var(--accent)" },
               ].map(({label,value,color}) => (
                 <div key={label} style={{ display:"flex", justifyContent:"space-between", padding:"9px 0", borderBottom:"1px solid var(--border)" }}>
                   <span style={{ fontSize:9, color:"var(--text2)" }}>{label}</span>
@@ -984,15 +1252,48 @@ function ProbabilityPage({ symbol, stockData }) {
             </div>
 
             <div className="card">
-              <div className="section-label">METHODOLOGY</div>
+              <div className="section-label">PERCENTILE FORECAST TABLE</div>
+              <div style={{ fontSize:8, color:"var(--text3)", marginBottom:12 }}>Final price distribution over {horizon}D horizon</div>
+              {[
+                { pct:"5th",  price:result.p5,  pnl:((result.p5 -result.S0)/result.S0)*100, color:"var(--accent)" },
+                { pct:"10th", price:result.p10, pnl:((result.p10-result.S0)/result.S0)*100, color:"var(--accent)" },
+                { pct:"25th", price:result.p25, pnl:((result.p25-result.S0)/result.S0)*100, color:"var(--text2)" },
+                { pct:"50th", price:result.median, pnl:result.medianReturn,                  color:"var(--text)" },
+                { pct:"75th", price:result.p75, pnl:((result.p75-result.S0)/result.S0)*100, color:"var(--text2)" },
+                { pct:"90th", price:result.p90, pnl:((result.p90-result.S0)/result.S0)*100, color:"var(--green)" },
+                { pct:"95th", price:result.p95, pnl:((result.p95-result.S0)/result.S0)*100, color:"var(--green)" },
+              ].map(({pct,price,pnl,color}) => (
+                <div key={pct} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:"1px solid var(--border)" }}>
+                  <span style={{ fontSize:9, color:"var(--text3)", width:36 }}>{pct}</span>
+                  <div style={{ flex:1, margin:"0 12px" }}>
+                    <div className="progress-wrap">
+                      <div className="progress-bar" style={{ width:`${Math.min(100,Math.max(0,((price-result.p5)/(result.p95-result.p5+1e-9))*100))}%`, background:color+"99" }}/>
+                    </div>
+                  </div>
+                  <span style={{ fontSize:10, fontWeight:700, color, width:60, textAlign:"right" }}>${fmt(price)}</span>
+                  <span style={{ fontSize:9, color, width:52, textAlign:"right" }}>{fmtPct(pnl)}</span>
+                </div>
+              ))}
+              <div style={{ marginTop:12, padding:"8px 0", display:"flex", justifyContent:"space-between", borderTop:"1px solid var(--border2)" }}>
+                <span style={{ fontSize:8, color:"var(--text3)" }}>ENTRY PRICE</span>
+                <span style={{ fontSize:10, fontWeight:700, color:"var(--yellow)" }}>${fmt(result.S0)}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* ── Methodology ── */}
+          <div className="card">
+            <div className="section-label">METHODOLOGY</div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"0 24px" }}>
               {[
                 { name:"Geometric Brownian Motion", desc:"dS = μS dt + σS dW — stochastic process with drift & vol calibrated from 90-day historical log-returns." },
-                { name:"Markov Chain (3-state)",    desc:"Bear/Neutral/Bull transition matrix estimated from return sign sequences. Captures regime persistence." },
-                { name:"Monte Carlo (1000 paths)",  desc:"1000 GBM sims with AI-adjusted parameters. P(up) = fraction of paths ending above entry." },
-                { name:"Groq LLM Sentiment",        desc:"LLaMA 3.3-70b analyzes synthesized headlines → drift adj + vol multiplier fed into simulation." },
-                { name:"VaR 95% / Sharpe",          desc:"VaR = 95th-pct worst-case from final price distribution. Sharpe = (μ − r_f) / σ, rf = 5%." },
+                { name:"Markov Chain (3-state)",    desc:"Bear/Neutral/Bull transition matrix from return sign sequences; captures regime persistence and clustering." },
+                { name:"Monte Carlo (1000 paths)",  desc:"1000 GBM sims with AI-adjusted parameters. P(up) = fraction of paths ending above entry price." },
+                { name:"Groq LLM Sentiment",        desc:"LLaMA 3.3-70b synthesizes 8 headlines → sentiment score → drift adjustment + vol multiplier fed into GBM." },
+                { name:"VaR 95% / VaR 99%",         desc:"Value at Risk = Nth-percentile worst-case loss from 1000-path final price distribution." },
+                { name:"Sharpe Ratio",              desc:"Sharpe = (μ − r_f) / σ, using risk-free rate r_f = 5%. Measures return per unit of risk." },
               ].map(({name,desc}) => (
-                <div key={name} style={{ padding:"9px 0", borderBottom:"1px solid var(--border)" }}>
+                <div key={name} style={{ padding:"10px 0", borderBottom:"1px solid var(--border)" }}>
                   <div style={{ fontSize:9, fontWeight:700, color:"var(--text)", marginBottom:3 }}>{name}</div>
                   <div style={{ fontSize:9, color:"var(--text3)", lineHeight:1.65, fontFamily:"var(--sans)" }}>{desc}</div>
                 </div>
@@ -1005,7 +1306,7 @@ function ProbabilityPage({ symbol, stockData }) {
   );
 }
 
-// ─── PAGE: PORTFOLIO ──────────────────────────────────────────────────────────
+// ─── PAGE: PORTFOLIO / WATCHLIST ──────────────────────────────────────────────
 function PortfolioPage({ watchlist, setWatchlist, allQuotes }) {
   const [newSym, setNewSym]   = useState("");
   const [adding, setAdding]   = useState(false);
@@ -1016,15 +1317,11 @@ function PortfolioPage({ watchlist, setWatchlist, allQuotes }) {
 
   const handleAdd = () => {
     const sym = newSym.toUpperCase().trim();
-    if (sym && !watchlist.includes(sym)) {
-      setWatchlist(prev => [...prev, sym]);
-    }
+    if (sym && !watchlist.includes(sym)) setWatchlist(prev => [...prev, sym]);
     setNewSym(""); setAdding(false);
   };
-
   const handleRemove = (sym) => setWatchlist(prev => prev.filter(s => s !== sym));
-
-  const handleSort = (col) => {
+  const handleSort   = (col) => {
     if (sortBy === col) setSortDir(d => -d);
     else { setSortBy(col); setSortDir(-1); }
   };
@@ -1034,17 +1331,18 @@ function PortfolioPage({ watchlist, setWatchlist, allQuotes }) {
     const results = {};
     for (const sym of watchlist) {
       const q = allQuotes[sym];
-      if (!q?.prices) continue;
+      if (!q?.prices || q.prices.length < 2) continue;
       try {
         const gbm   = estimateGBM(q.prices);
         const paths = runMonteCarlo({ S0:q.latest, mu:gbm.mu, sigma:gbm.sigma, days:30, n:300 });
+        if (paths.length === 0) continue;
         const finals = paths.map(p=>p[p.length-1]);
         const sorted = [...finals].sort((a,b)=>a-b);
         results[sym] = {
           probUp: (finals.filter(f=>f>q.latest).length/finals.length)*100,
           median: sorted[Math.floor(sorted.length/2)],
           var95:  calcVaR(finals,q.latest,0.95),
-          sharpe: calcSharpe(gbm.mu, gbm.sigma),
+          sharpe: calcSharpe(gbm.mu,gbm.sigma),
           mu:     gbm.mu, sigma: gbm.sigma,
         };
       } catch {}
@@ -1061,12 +1359,8 @@ function PortfolioPage({ watchlist, setWatchlist, allQuotes }) {
     return (av - bv) * sortDir;
   });
 
-  const thStyle = (col) => ({
-    cursor:"pointer",
-    color: sortBy===col ? "var(--text2)" : undefined,
-    userSelect:"none",
-  });
-  const arrow = (col) => sortBy===col ? (sortDir > 0 ? " ↑" : " ↓") : "";
+  const thStyle = (col) => ({ cursor:"pointer", color:sortBy===col?"var(--text2)":undefined, userSelect:"none" });
+  const arrow   = (col) => sortBy===col ? (sortDir>0?" ↑":" ↓") : "";
 
   return (
     <div style={{ padding:"24px 36px", flex:1 }}>
@@ -1076,7 +1370,7 @@ function PortfolioPage({ watchlist, setWatchlist, allQuotes }) {
           <div style={{ fontSize:10, color:"var(--text2)" }}>Track symbols · run batch MC analysis · compare risk metrics</div>
         </div>
         <div style={{ display:"flex", gap:10 }}>
-          <button className="btn btn-outline" onClick={() => setAdding(a => !a)}>+ ADD SYMBOL</button>
+          <button className="btn btn-outline" onClick={()=>setAdding(a=>!a)}>+ ADD SYMBOL</button>
           <button className="btn btn-accent" onClick={runAllSims} disabled={runningAll}>
             {runningAll ? "RUNNING…" : "▶  RUN ALL SIMS (30D)"}
           </button>
@@ -1087,9 +1381,9 @@ function PortfolioPage({ watchlist, setWatchlist, allQuotes }) {
         <div style={{ marginBottom:18, display:"flex", gap:8, alignItems:"center" }}>
           <input className="input" style={{ maxWidth:180 }} placeholder="e.g. GOOGL" value={newSym}
             onChange={e=>setNewSym(e.target.value.toUpperCase())}
-            onKeyDown={e=>e.key==="Enter"&&handleAdd()} autoFocus />
+            onKeyDown={e=>e.key==="Enter"&&handleAdd()} autoFocus/>
           <button className="btn btn-primary" onClick={handleAdd}>ADD</button>
-          <button className="btn btn-ghost" onClick={()=>setAdding(false)}>CANCEL</button>
+          <button className="btn btn-ghost"   onClick={()=>setAdding(false)}>CANCEL</button>
         </div>
       )}
 
@@ -1098,13 +1392,13 @@ function PortfolioPage({ watchlist, setWatchlist, allQuotes }) {
           <thead>
             <tr>
               <th style={{ textAlign:"left", paddingLeft:20 }}>SYMBOL</th>
-              <th onClick={()=>handleSort("price")} style={thStyle("price")}>PRICE{arrow("price")}</th>
+              <th onClick={()=>handleSort("price")}  style={thStyle("price")}>PRICE{arrow("price")}</th>
               <th onClick={()=>handleSort("change")} style={thStyle("change")}>CHG %{arrow("change")}</th>
               <th onClick={()=>handleSort("probUp")} style={thStyle("probUp")}>P(UP) 30D{arrow("probUp")}</th>
               <th onClick={()=>handleSort("median")} style={thStyle("median")}>MEDIAN{arrow("median")}</th>
-              <th onClick={()=>handleSort("var95")} style={thStyle("var95")}>VAR 95%{arrow("var95")}</th>
+              <th onClick={()=>handleSort("var95")}  style={thStyle("var95")}>VAR 95%{arrow("var95")}</th>
               <th onClick={()=>handleSort("sharpe")} style={thStyle("sharpe")}>SHARPE{arrow("sharpe")}</th>
-              <th onClick={()=>handleSort("sigma")} style={thStyle("sigma")}>VOL (σ){arrow("sigma")}</th>
+              <th onClick={()=>handleSort("sigma")}  style={thStyle("sigma")}>VOL (σ){arrow("sigma")}</th>
               <th>SPARK</th>
               <th></th>
             </tr>
@@ -1113,22 +1407,22 @@ function PortfolioPage({ watchlist, setWatchlist, allQuotes }) {
             {rows.map(row => (
               <tr key={row.sym}>
                 <td style={{ textAlign:"left", paddingLeft:20, fontWeight:700, fontSize:12 }}>{row.sym}</td>
-                <td>{row.price != null ? "$"+fmt(row.price) : <span style={{ color:"var(--text3)" }}>—</span>}</td>
-                <td style={{ color:colorChg(row.change??0) }}>{row.change != null ? fmtPct(row.change) : "—"}</td>
+                <td>{row.price!=null ? "$"+fmt(row.price) : <span style={{ color:"var(--text3)" }}>—</span>}</td>
+                <td style={{ color:colorChg(row.change??0) }}>{row.change!=null ? fmtPct(row.change) : "—"}</td>
                 <td style={{ color:row.probUp!=null?(row.probUp>50?"var(--green)":"var(--accent)"):"var(--text3)" }}>
-                  {row.probUp != null ? fmt(row.probUp,1)+"%" : <span style={{ color:"var(--text3)" }}>—</span>}
+                  {row.probUp!=null ? fmt(row.probUp,1)+"%" : <span style={{ color:"var(--text3)" }}>—</span>}
                 </td>
                 <td style={{ color:row.median!=null?colorChg((row.median??0)-(row.price??0)):"var(--text3)" }}>
-                  {row.median != null ? "$"+fmt(row.median) : "—"}
+                  {row.median!=null ? "$"+fmt(row.median) : "—"}
                 </td>
-                <td style={{ color:"var(--accent)" }}>{row.var95 != null ? fmt(row.var95,1)+"%" : "—"}</td>
+                <td style={{ color:"var(--accent)" }}>{row.var95!=null ? fmt(row.var95,1)+"%" : "—"}</td>
                 <td style={{ color:row.sharpe!=null?(row.sharpe>1?"var(--green)":row.sharpe>0?"var(--yellow)":"var(--accent)"):"var(--text3)" }}>
-                  {row.sharpe != null ? fmt(row.sharpe,2) : "—"}
+                  {row.sharpe!=null ? fmt(row.sharpe,2) : "—"}
                 </td>
-                <td style={{ color:"var(--text2)" }}>{row.sigma != null ? fmt(row.sigma*100,1)+"%" : "—"}</td>
+                <td style={{ color:"var(--text2)" }}>{row.sigma!=null ? fmt(row.sigma*100,1)+"%" : "—"}</td>
                 <td>
-                  {row.prices?.length > 1 && (
-                    <Sparkline prices={row.prices.slice(-20)} change={row.change??0} width={50} height={18} />
+                  {row.prices?.length>1 && (
+                    <Sparkline prices={row.prices.slice(-20)} change={row.change??0} width={50} height={18}/>
                   )}
                 </td>
                 <td>
@@ -1145,7 +1439,7 @@ function PortfolioPage({ watchlist, setWatchlist, allQuotes }) {
 
       {Object.keys(mcResults).length > 0 && (
         <div style={{ marginTop:14, fontSize:9, color:"var(--text3)" }}>
-          * MC results use 300-path simulation without AI sentiment adjustment for speed. Run full analysis per symbol for precise figures.
+          * MC results use 300-path simulation without AI sentiment for speed. Run full analysis per symbol for precise figures.
         </div>
       )}
     </div>
@@ -1157,7 +1451,7 @@ function TickerBar({ quotes, watchlist, selected, onSelect }) {
   return (
     <div className="ticker-bar">
       {watchlist.map(sym => {
-        const q = quotes[sym];
+        const q   = quotes[sym];
         const chg = q?.change ?? 0;
         return (
           <div key={sym} className={`ticker-item${selected===sym?" selected":""}`} onClick={()=>onSelect(sym)}>
@@ -1174,8 +1468,8 @@ function TickerBar({ quotes, watchlist, selected, onSelect }) {
 
 // ─── ROOT APP ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const [page, setPage]         = useState("news");
-  const [symbol, setSymbol]     = useState("AAPL");
+  const [page, setPage]           = useState("news");
+  const [symbol, setSymbol]       = useState("AAPL");
   const [watchlist, setWatchlist] = useState(DEFAULT_WATCHLIST);
   const [allQuotes, setAllQuotes] = useState({});
   const [stockData, setStockData] = useState(null);
@@ -1189,7 +1483,7 @@ export default function App() {
       const data = await fetchStockData(sym);
       setStockData(data);
       setAllQuotes(q => ({ ...q, [sym]: data }));
-    } catch(e) { console.error(e); }
+    } catch(e) { console.error("loadStock error:", e); }
     setLoadingStock(false);
   }, []);
 
@@ -1204,7 +1498,6 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [watchlist.join(",")]);
 
-  // Load selected symbol on change
   useEffect(() => { loadStock(symbol); }, [symbol, loadStock]);
 
   const handleSelectSymbol = useCallback((sym) => {
@@ -1212,7 +1505,6 @@ export default function App() {
     setPage("news");
   }, []);
 
-  // Sync watchlist: if new symbol added, load its quote
   useEffect(() => {
     watchlist.forEach(sym => {
       if (!allQuotes[sym]) {
@@ -1239,7 +1531,7 @@ export default function App() {
         <div className="nav">
           <div className="nav-brand">
             <span className="nav-logo">STOCKPROB</span>
-            <span className="nav-version">PROBABILITY ENGINE v2.0</span>
+            <span className="nav-version">PROBABILITY ENGINE v2.1</span>
           </div>
           <div className="nav-tabs">
             {PAGES.map(p => (
@@ -1252,13 +1544,10 @@ export default function App() {
           </div>
         </div>
 
-        {/* Env banner if keys missing */}
         {!keysOk && <EnvBanner/>}
 
-        {/* Ticker */}
         <TickerBar quotes={allQuotes} watchlist={watchlist} selected={symbol} onSelect={handleSelectSymbol}/>
 
-        {/* Status */}
         {loadingStock && (
           <div style={{ padding:"7px 36px", background:"var(--surface)", borderBottom:"1px solid var(--border)", display:"flex", gap:8, alignItems:"center" }}>
             <div className="loader-dots"><span/><span/><span/></div>
@@ -1266,7 +1555,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Pages */}
         <div className="slide-in" key={page+symbol}>
           {page === "news"        && <NewsPage        symbol={symbol} stockData={stockData}/>}
           {page === "simulation"  && <SimulationPage  symbol={symbol} stockData={stockData}/>}
